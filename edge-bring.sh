@@ -1,27 +1,88 @@
 #!/bin/bash
+###############################################################################
 #
-# edge-bringup.sh — VRF / loopback bring-up + FRR verification
-#                   + Docker purge + IPv6 RA/SLAAC lockdown
-#                   + VRF l3mdev_accept + IPv6 disable_ipv6 recovery
-#                   + aggressive legacy-loopback purge
-#                   + data-driven multi-VRF topology
-#                   + stale-IP reconciliation on dummy loopbacks
-#                   + -l listing mode + interactive confirmation
+# edge-bringup.sh
 #
-# ============================================================================
-# CLI OPTIONS:
-#   -l, --list     List all supported environment variables with their
-#                  default values and current (effective) values, then exit.
-#   -y, --yes      Skip the interactive confirmation prompt.
-#   -h, --help     Show usage.
-# ============================================================================
+# Baseline version   : 1.0
+# Release date       : 2026-05-02
+# Supported platform : Ubuntu 22.04 / 24.04 with FRRouting + Linux VRFs
+#
+# ---------------------------------------------------------------------------
+# PURPOSE
+# ---------------------------------------------------------------------------
+#   Reliable, idempotent bring-up of a multi-VRF edge router running FRR on
+#   Ubuntu. One script handles every regional node (Madrid, Paris, Berlin,
+#   Beijing, …) via environment-variable overrides.
+#
+# ---------------------------------------------------------------------------
+# FEATURES
+# ---------------------------------------------------------------------------
+#   0.  CLI: -l/--list, -y/--yes, -h/--help
+#   1.  Interactive confirmation with full per-host diff
+#   2.  Pre-flight config validation
+#   3.  Kernel hardening (ip_forward, rp_filter, IPv6 forwarding,
+#       per-iface tuning, l3mdev_accept)
+#   4.  IPv6 RA/SLAAC lockdown + disable_ipv6 auto-recovery
+#   5.  Persistent sysctls written to /etc/sysctl.d/90-edge-router.conf
+#   6.  Full Docker purge (stop / disable / apt purge / bridges / artifacts)
+#   7.  Aggressive legacy loopback cleanup (lo0..lo9) with 5 safety gates
+#   8.  Data-driven multi-VRF topology (VRF_SPECS)
+#   9.  Physical NIC -> VRF with address re-seat (fixes Linux 'noprefixroute'
+#       VRF-FIB sync quirk)
+#   10. Stale-IP reconciliation on physical NICs AND dummy loopbacks
+#   11. RFC 3056 6to4 IPv6 auto-derivation for physical NICs
+#       (dummies keep their own scheme)
+#   12. FRR start and per-daemon health verification
+#
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+#   sudo edge-bringup.sh              # interactive run with defaults
+#   sudo edge-bringup.sh -l           # list all env vars + defaults, exit
+#   sudo edge-bringup.sh -y           # skip confirmation prompt
+#   sudo edge-bringup.sh -h           # help
+#
+# ---------------------------------------------------------------------------
+# COMMON USAGE
+# ---------------------------------------------------------------------------
+#   # Madrid (vrf10=ens192, vrf20=ens256)
+#   sudo MGMT_IFACE=ens224 VRF10_IFACE=ens192 VRF20_IFACE=ens256 \
+#        SUBNET_OCTET=110 edge-bringup.sh
+#
+#   # Paris (vrf10=ens224, vrf20=ens256, mgmt=ens160)
+#   sudo MGMT_IFACE=ens160 VRF10_IFACE=ens224 VRF20_IFACE=ens256 \
+#        SUBNET_OCTET=114 edge-bringup.sh
+#
+#   # Beijing (vrf10 + vrf30 only)
+#   sudo MGMT_IFACE=ens224 VRF10_IFACE=ens192 VRF30_IFACE=ens256 \
+#        SUBNET_OCTET=113 VRF_EXCLUDE="vrf20" edge-bringup.sh
+#
+# ---------------------------------------------------------------------------
+# CHANGELOG
+# ---------------------------------------------------------------------------
+#   1.0  (2026-05-02)  BASELINE RELEASE
+#        - Idempotent VRF / loopback / FRR bring-up
+#        - Docker full purge mode
+#        - Multi-layer safety for legacy loopback cleanup (supports VRF-attached)
+#        - IPv6 SLAAC lockdown + disable_ipv6 recovery
+#        - VRF l3mdev_accept sysctls (fixes silent BGP/OSPF drops)
+#        - Per-iface rp_filter=0 + NIC address re-seating
+#        - Data-driven N-VRF topology via VRF_SPECS
+#        - Stale-IP reconciliation on dummies (strips non-matching addrs)
+#        - CLI flags: -l / -y / -h
+#        - Interactive confirmation screen with per-variable diff
+#        - RFC 3056 6to4 IPv6 auto-derivation for physical NICs in VRFs
+#
+###############################################################################
 
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
+SCRIPT_VERSION="1.0"
+SCRIPT_RELEASE_DATE="2026-05-02"
 
 ############################
-# CLI ARG PARSING (before any config evaluation)
+# CLI ARG PARSING
 ############################
 
 MODE_LIST=0
@@ -31,22 +92,37 @@ for arg in "$@"; do
     case "$arg" in
         -l|--list)   MODE_LIST=1 ;;
         -y|--yes)    MODE_YES=1 ;;
+        -v|--version)
+            echo "$SCRIPT_NAME version $SCRIPT_VERSION (released $SCRIPT_RELEASE_DATE)"
+            exit 0
+            ;;
         -h|--help)
             cat <<EOF
+$SCRIPT_NAME v$SCRIPT_VERSION (released $SCRIPT_RELEASE_DATE)
+
 Usage: sudo $SCRIPT_NAME [options]
 
 Options:
-  -l, --list     List all supported environment variables (with defaults
-                 and effective values) and exit.
-  -y, --yes      Skip the interactive confirmation prompt.
-  -h, --help     Show this help.
+  -l, --list       List all supported environment variables (with defaults
+                   and effective values) and exit.
+  -y, --yes        Skip the interactive confirmation prompt.
+  -v, --version    Print the script version and exit.
+  -h, --help       Show this help.
 
 Environment variables:
   Run '$SCRIPT_NAME -l' to see the full list with defaults.
 
-Example:
+IPv6 auto-derivation (physical NICs in VRFs only):
+  If you don't explicitly set VRFxx_V6, the script derives it from VRFxx_V4
+  using RFC 3056 6to4 mapping. Example:
+    VRF10_V4=192.168.113.200/24  ->  VRF10_V6=2002:c0a8:7164::200/64
+
+Examples:
   sudo MGMT_IFACE=ens224 VRF10_IFACE=ens192 VRF20_IFACE=ens256 \\
        SUBNET_OCTET=110 $SCRIPT_NAME
+
+  sudo MGMT_IFACE=ens224 VRF10_IFACE=ens192 VRF30_IFACE=ens256 \\
+       SUBNET_OCTET=113 VRF_EXCLUDE="vrf20" $SCRIPT_NAME
 EOF
             exit 0
             ;;
@@ -59,41 +135,76 @@ EOF
 done
 
 ############################
-# ENV VAR METADATA (single source of truth)
+# 6to4 IPv6 DERIVATION (RFC 3056)
 ############################
-#
-# Each entry describes one overridable variable so that:
-#   - '-l' can list it
-#   - The confirmation screen can show default vs effective
-#   - The script stays self-documenting
-#
-# Format: "VAR_NAME|DEFAULT|DESCRIPTION"
+
+# Convert IPv4 (with or without /prefix) to the 6to4 prefix (no host suffix).
+#   "192.168.113.100/24"  ->  "2002:c0a8:7164::"
+ipv4_to_6to4_prefix() {
+    local ipv4_cidr=$1
+    local ipv4=${ipv4_cidr%/*}
+
+    local a b c d
+    IFS='.' read -r a b c d <<< "$ipv4"
+
+    if [[ -z "$a" || -z "$b" || -z "$c" || -z "$d" ]]; then
+        echo ""
+        return 1
+    fi
+
+    local first second
+    first=$(printf '%02x%02x' "$a" "$b")
+    second=$(printf '%02x%02x' "$c" "$d")
+
+    # Trim leading zeros (canonical IPv6 form)
+    first=$(printf '%x' "$((16#$first))")
+    second=$(printf '%x' "$((16#$second))")
+
+    echo "2002:${first}:${second}::"
+}
+
+# Full 6to4 address: "192.168.113.100/24" + "200" -> "2002:c0a8:7164::200/64"
+ipv4_to_6to4_host() {
+    local ipv4_cidr=$1
+    local host_suffix=$2
+    local prefix_len=${3:-64}
+
+    local prefix
+    prefix=$(ipv4_to_6to4_prefix "$ipv4_cidr") || { echo ""; return 1; }
+    [[ -z "$prefix" ]] && { echo ""; return 1; }
+
+    echo "${prefix}${host_suffix}/${prefix_len}"
+}
+
+############################
+# ENV VAR METADATA
+############################
 
 ENV_VARS_META=(
 "MGMT_IFACE|ens224|Management NIC (default route iface). NEVER modified."
-"SUBNET_OCTET|110|Third octet used in loopback and NIC addressing (e.g. 110=Madrid, 113=Beijing, 114=Paris)."
-"HOST_OCTET|200|Host part for physical NIC addresses (e.g. 192.168.X.200)."
-"VRF10_IFACE|-|Physical NIC to place in vrf10 (use '-' or leave unset to skip)."
-"VRF10_V4|(auto)|IPv4 for the vrf10 NIC. Auto-derived if not set."
-"VRF10_V6|(auto)|IPv6 for the vrf10 NIC. Auto-derived if not set."
-"VRF20_IFACE|-|Physical NIC to place in vrf20 (use '-' or leave unset to skip)."
-"VRF20_V4|(auto)|IPv4 for the vrf20 NIC. Auto-derived if not set."
-"VRF20_V6|(auto)|IPv6 for the vrf20 NIC. Auto-derived if not set."
-"VRF30_IFACE|-|Physical NIC to place in vrf30 (use '-' or leave unset to skip)."
-"VRF30_V4|(auto)|IPv4 for the vrf30 NIC. Auto-derived if not set."
-"VRF30_V6|(auto)|IPv6 for the vrf30 NIC. Auto-derived if not set."
-"VRF_EXCLUDE||Space-separated list of VRFs to skip entirely (e.g. 'vrf20')."
-"LEGACY_LOOPBACK_REMOVE_FROM_VRF|yes|If 'yes', purge legacy lo0..lo9 even if enslaved to a VRF."
-"DOCKER_CLEANUP_MODE|purge|Docker disposition: 'none' | 'stop' | 'purge'."
-"FRR_FORCE_RESTART|0|Set to '1' to force restart FRR even if already healthy."
+"SUBNET_OCTET|110|Third octet in loopback/NIC addressing (110=Madrid, 113=Beijing, 114=Paris)."
+"HOST_OCTET|200|Host part for physical NIC addresses (also used as v6 host suffix)."
+"VRF10_IFACE|-|Physical NIC to place in vrf10 ('-' or unset to skip)."
+"VRF10_V4|(auto)|IPv4 for vrf10 NIC. Auto-derived from SUBNET_OCTET/HOST_OCTET."
+"VRF10_V6|(auto-6to4)|IPv6 for vrf10 NIC. Auto-derived from VRF10_V4 via RFC 3056."
+"VRF20_IFACE|-|Physical NIC to place in vrf20 ('-' or unset to skip)."
+"VRF20_V4|(auto)|IPv4 for vrf20 NIC. Auto-derived."
+"VRF20_V6|(auto-6to4)|IPv6 for vrf20 NIC. Auto-derived from VRF20_V4 via RFC 3056."
+"VRF30_IFACE|-|Physical NIC to place in vrf30 ('-' or unset to skip)."
+"VRF30_V4|(auto)|IPv4 for vrf30 NIC. Auto-derived."
+"VRF30_V6|(auto-6to4)|IPv6 for vrf30 NIC. Auto-derived from VRF30_V4 via RFC 3056."
+"VRF_EXCLUDE||Space-separated list of VRFs to skip entirely."
+"LEGACY_LOOPBACK_REMOVE_FROM_VRF|yes|If 'yes', purge legacy lo0..lo9 even in VRFs."
+"DOCKER_CLEANUP_MODE|purge|'none' | 'stop' | 'purge'."
+"FRR_FORCE_RESTART|0|Set '1' to force FRR restart even if healthy."
 "FRR_PRE_START_WAIT|5|Seconds to wait before starting/verifying FRR."
-"FRR_POST_START_WAIT|5|Seconds to wait after starting FRR for daemons to init."
-"FRR_DAEMON_CHECK_RETRIES|6|Number of poll attempts per daemon check."
-"FRR_DAEMON_CHECK_INTERVAL|2|Seconds between daemon-check polls."
+"FRR_POST_START_WAIT|5|Seconds to wait after starting FRR."
+"FRR_DAEMON_CHECK_RETRIES|6|Poll attempts per daemon."
+"FRR_DAEMON_CHECK_INTERVAL|2|Seconds between polls."
 )
 
 ############################
-# DEFAULTS (applied only if env var is unset)
+# DEFAULTS
 ############################
 
 MGMT_IFACE="${MGMT_IFACE:-ens224}"
@@ -111,132 +222,133 @@ FRR_DAEMON_CHECK_RETRIES="${FRR_DAEMON_CHECK_RETRIES:-6}"
 FRR_DAEMON_CHECK_INTERVAL="${FRR_DAEMON_CHECK_INTERVAL:-2}"
 FRR_MANDATORY_DAEMONS=(zebra)
 
-# VRF-specific NIC defaults (initialized to '-' and filled in via env overrides)
 VRF10_IFACE="${VRF10_IFACE:--}"
 VRF20_IFACE="${VRF20_IFACE:--}"
 VRF30_IFACE="${VRF30_IFACE:--}"
 
 VRF10_V4="${VRF10_V4:-192.168.${SUBNET_OCTET}.${HOST_OCTET}/24}"
-VRF10_V6="${VRF10_V6:-2002:c0a8:$(printf '6e%02x' $SUBNET_OCTET)::${HOST_OCTET}/64}"
 VRF20_V4="${VRF20_V4:-172.20.${SUBNET_OCTET}.${HOST_OCTET}/24}"
-VRF20_V6="${VRF20_V6:-2002:ac14:$(printf '6e%02x' $SUBNET_OCTET)::${HOST_OCTET}/64}"
 VRF30_V4="${VRF30_V4:-172.30.${SUBNET_OCTET}.${HOST_OCTET}/24}"
-VRF30_V6="${VRF30_V6:-2002:ac1e:$(printf '71%02x' $SUBNET_OCTET)::${HOST_OCTET}/64}"
+
+# IPv6 6to4 auto-derivation
+declare -A V6_SOURCE=()
+
+_derive_v6() {
+    local vrf_name=$1
+    local v6_var_name="${vrf_name}_V6"
+    local v4_var_name="${vrf_name}_V4"
+    local v4="${!v4_var_name}"
+
+    if [[ -n "${!v6_var_name+x}" && -n "${!v6_var_name:-}" ]]; then
+        V6_SOURCE[$vrf_name]="explicit"
+        return 0
+    fi
+
+    local derived
+    derived=$(ipv4_to_6to4_host "$v4" "$HOST_OCTET" 64)
+    if [[ -n "$derived" ]]; then
+        eval "${v6_var_name}=\"\$derived\""
+        V6_SOURCE[$vrf_name]="6to4-auto"
+    else
+        eval "${v6_var_name}=\"-\""
+        V6_SOURCE[$vrf_name]="fallback-empty"
+    fi
+}
+
+_derive_v6 VRF10
+_derive_v6 VRF20
+_derive_v6 VRF30
 
 ############################
 # LISTING / CONFIRMATION HELPERS
 ############################
 
-# Returns the original default value for a given variable name.
-# Re-derives auto-derived defaults so that '-l' and the confirmation
-# screen show the current effective default.
 _default_for() {
     local key=$1
     case "$key" in
-        MGMT_IFACE)                         echo "ens224" ;;
-        SUBNET_OCTET)                       echo "110" ;;
-        HOST_OCTET)                         echo "200" ;;
+        MGMT_IFACE)                          echo "ens224" ;;
+        SUBNET_OCTET)                        echo "110" ;;
+        HOST_OCTET)                          echo "200" ;;
         VRF10_IFACE|VRF20_IFACE|VRF30_IFACE) echo "-" ;;
-        VRF10_V4)                           echo "192.168.110.200/24 (auto)" ;;
-        VRF10_V6)                           echo "2002:c0a8:6e6e::200/64 (auto)" ;;
-        VRF20_V4)                           echo "172.20.110.200/24 (auto)" ;;
-        VRF20_V6)                           echo "2002:ac14:6e6e::200/64 (auto)" ;;
-        VRF30_V4)                           echo "172.30.110.200/24 (auto)" ;;
-        VRF30_V6)                           echo "2002:ac1e:716e::200/64 (auto)" ;;
-        VRF_EXCLUDE)                        echo "(empty)" ;;
-        LEGACY_LOOPBACK_REMOVE_FROM_VRF)    echo "yes" ;;
-        DOCKER_CLEANUP_MODE)                echo "purge" ;;
-        FRR_FORCE_RESTART)                  echo "0" ;;
-        FRR_PRE_START_WAIT)                 echo "5" ;;
-        FRR_POST_START_WAIT)                echo "5" ;;
-        FRR_DAEMON_CHECK_RETRIES)           echo "6" ;;
-        FRR_DAEMON_CHECK_INTERVAL)          echo "2" ;;
-        *)                                  echo "(unknown)" ;;
+        VRF10_V4)                            echo "192.168.110.200/24 (auto)" ;;
+        VRF10_V6)                            echo "(auto from V4 via 6to4)" ;;
+        VRF20_V4)                            echo "172.20.110.200/24 (auto)" ;;
+        VRF20_V6)                            echo "(auto from V4 via 6to4)" ;;
+        VRF30_V4)                            echo "172.30.110.200/24 (auto)" ;;
+        VRF30_V6)                            echo "(auto from V4 via 6to4)" ;;
+        VRF_EXCLUDE)                         echo "(empty)" ;;
+        LEGACY_LOOPBACK_REMOVE_FROM_VRF)     echo "yes" ;;
+        DOCKER_CLEANUP_MODE)                 echo "purge" ;;
+        FRR_FORCE_RESTART)                   echo "0" ;;
+        FRR_PRE_START_WAIT)                  echo "5" ;;
+        FRR_POST_START_WAIT)                 echo "5" ;;
+        FRR_DAEMON_CHECK_RETRIES)            echo "6" ;;
+        FRR_DAEMON_CHECK_INTERVAL)           echo "2" ;;
+        *)                                   echo "(unknown)" ;;
     esac
 }
 
-# Returns 1 if the user explicitly set the variable in the environment
-# (i.e. the effective value differs from the compile-time default-of-defaults).
-_is_overridden() {
-    local key=$1
-    # Use env + a canary to check whether the var was set explicitly.
-    # Bash parameter expansion lets us detect "set to empty" vs "unset":
-    #   "${var+x}" prints "x" if set (even to empty), nothing if unset.
-    local -n ref="$key" 2>/dev/null || return 0
-    # Fallback: compare against the canonical default string
-    local default
-    default="$(_default_for "$key")"
-    # Strip "(auto)" suffix from default for comparison
-    default="${default% (auto)}"
-    if [[ "${ref}" == "${default}" ]]; then
-        return 1  # not overridden
-    fi
-    return 0
-}
-
-# Print all env vars in aligned columns.
-# Arg 1: "show-effective"  → print both default and effective values
-#        "simple"          → print only defaults (for -l without overrides)
 print_env_vars() {
-    local mode=${1:-show-effective}
-    local entry key default desc effective marker
+    local entry key default desc effective marker source_tag clean_default
 
-    printf "\n%-32s %-28s %-28s %s\n" "VARIABLE" "DEFAULT" "EFFECTIVE" "DESCRIPTION"
-    printf "%-32s %-28s %-28s %s\n"   "--------" "-------" "---------" "-----------"
+    printf "\n%-32s %-28s %-34s %s\n" "VARIABLE" "DEFAULT" "EFFECTIVE" "DESCRIPTION"
+    printf "%-32s %-28s %-34s %s\n"   "--------" "-------" "---------" "-----------"
 
     for entry in "${ENV_VARS_META[@]}"; do
         key=${entry%%|*}
         default=$(_default_for "$key")
-
-        # Read the current effective value indirectly
         effective="${!key-}"
         [[ -z "$effective" ]] && effective="(empty)"
-        [[ "$effective" == "-" ]] && effective="-"
 
-        # Mark overridden values
-        if [[ "$effective" != "$default" && "$effective" != "${default% (auto)}" ]]; then
+        source_tag=""
+        case "$key" in
+            VRF10_V6) [[ "${V6_SOURCE[VRF10]:-}" == "6to4-auto" ]] && source_tag=" [6to4]" ;;
+            VRF20_V6) [[ "${V6_SOURCE[VRF20]:-}" == "6to4-auto" ]] && source_tag=" [6to4]" ;;
+            VRF30_V6) [[ "${V6_SOURCE[VRF30]:-}" == "6to4-auto" ]] && source_tag=" [6to4]" ;;
+        esac
+
+        clean_default="${default% (auto)}"
+        clean_default="${clean_default% (auto from V4 via 6to4)}"
+        clean_default="${clean_default% (empty)}"
+
+        if [[ "$effective" != "$default" && "$effective" != "$clean_default" && "$effective" != "(empty)" ]]; then
             marker=" *"
         else
             marker=""
         fi
 
         desc=${entry##*|}
-
-        if [[ "$mode" == "show-effective" ]]; then
-            printf "%-32s %-28s %-28s %s%s\n" "$key" "$default" "$effective" "$desc" "$marker"
-        else
-            printf "%-32s %-28s %s\n" "$key" "$default" "$desc"
-        fi
+        printf "%-32s %-28s %-34s %s%s\n" "$key" "$default" "${effective}${source_tag}" "$desc" "$marker"
     done
 
-    if [[ "$mode" == "show-effective" ]]; then
-        echo
-        echo "  (* = value differs from default — set via env var)"
-    fi
+    echo
+    echo "  * = set by user (differs from default)"
+    echo "  [6to4] = IPv6 auto-derived from IPv4 via RFC 3056 6to4 mapping"
     echo
 }
 
-# Return 0 if ANY tracked env var was overridden from its default.
 any_overrides() {
-    local entry key default effective
+    local entry key default effective clean_default
     for entry in "${ENV_VARS_META[@]}"; do
         key=${entry%%|*}
         default=$(_default_for "$key")
-        default="${default% (auto)}"
+        clean_default="${default% (auto)}"
+        clean_default="${clean_default% (auto from V4 via 6to4)}"
+        clean_default="${clean_default% (empty)}"
         effective="${!key-}"
-        if [[ "$effective" != "$default" && "$effective" != "(empty)" && -n "$effective" ]]; then
-            # handle empty-default case
-            if [[ "$default" == "(empty)" && -z "$effective" ]]; then
-                continue
-            fi
+        if [[ -n "$effective" && "$effective" != "$default" && "$effective" != "$clean_default" ]]; then
+            case "$key" in
+                VRF10_V6|VRF20_V6|VRF30_V6)
+                    local vrf="${key%_V6}"
+                    [[ "${V6_SOURCE[$vrf]:-}" == "6to4-auto" ]] && continue
+                    ;;
+            esac
             return 0
         fi
     done
     return 1
 }
 
-# Interactive confirmation. Exits if user declines.
-# Skipped if -y/--yes was passed or if stdin is not a TTY.
 confirm_or_exit() {
     local override_note="$1"
     echo
@@ -244,43 +356,64 @@ confirm_or_exit() {
     echo "  SCRIPT EXECUTION CONFIRMATION"
     echo "==========================================================================="
     echo
-    echo "  Host           : $(hostname)"
-    echo "  Script         : $SCRIPT_NAME"
-    echo "  Date           : $(date '+%Y-%m-%d %H:%M:%S %Z')"
-    echo "  User           : $(logname 2>/dev/null || echo "${SUDO_USER:-$USER}")"
+    echo "  Host      : $(hostname)"
+    echo "  Script    : $SCRIPT_NAME v$SCRIPT_VERSION"
+    echo "  Date      : $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "  User      : ${SUDO_USER:-$USER}"
     echo
-    if [[ -n "$override_note" ]]; then
-        echo "  $override_note"
-        echo
-    fi
+    [[ -n "$override_note" ]] && { echo "  $override_note"; echo; }
+
     echo "  Values that will be used:"
-    print_env_vars show-effective
+    print_env_vars
+
+    echo "  IPv6 6to4 AUTO-DERIVATIONS (physical NICs only):"
+    local v shown=0
+    for v in VRF10 VRF20 VRF30; do
+        local src="${V6_SOURCE[$v]:-}"
+        local v4_var="${v}_V4"
+        local v6_var="${v}_V6"
+        local iface_var="${v}_IFACE"
+        local iface="${!iface_var}"
+        [[ "$iface" == "-" ]] && continue
+        if [[ "$src" == "6to4-auto" ]]; then
+            printf "    %-8s  %-20s  ->  %s\n" "$v" "${!v4_var}" "${!v6_var}"
+            shown=1
+        elif [[ "$src" == "explicit" ]]; then
+            printf "    %-8s  %-20s  ->  %s  (user-specified, no derivation)\n" "$v" "${!v4_var}" "${!v6_var}"
+            shown=1
+        fi
+    done
+    [[ $shown -eq 0 ]] && echo "    (no physical NICs configured)"
+    echo
+    echo "  NOTE: Dummy loopbacks (lo101..lo304) keep their scheme:"
+    echo "        2002:10:<vrf>:<subnet>::<index>/128  (NOT 6to4-derived)"
+    echo
 
     echo "  ACTIONS THIS SCRIPT WILL PERFORM:"
-    echo "    • Apply kernel sysctls (ip_forward, rp_filter, IPv6 RA off, l3mdev)"
-    echo "    • Persist sysctls to /etc/sysctl.d/90-edge-router.conf"
+    echo "    - Apply kernel sysctls (ip_forward, rp_filter, IPv6 RA off, l3mdev)"
+    echo "    - Persist sysctls to /etc/sysctl.d/90-edge-router.conf"
     case "$DOCKER_CLEANUP_MODE" in
-        purge) echo "    • DOCKER: stop + disable + apt purge + remove bridges/artifacts" ;;
-        stop)  echo "    • DOCKER: stop + disable (packages left installed)" ;;
-        none)  echo "    • DOCKER: untouched" ;;
+        purge) echo "    - DOCKER: stop + disable + apt purge + remove bridges/artifacts" ;;
+        stop)  echo "    - DOCKER: stop + disable (packages left installed)" ;;
+        none)  echo "    - DOCKER: untouched" ;;
     esac
-    echo "    • Remove legacy loopbacks (lo0..lo9) from GRT${LEGACY_LOOPBACK_REMOVE_FROM_VRF:+ and VRFs}"
-    echo "    • Create/verify VRFs: ${ALL_VRFS_PREVIEW:-<computed later>}"
-    echo "    • Move physical NICs into their VRFs + re-seat addresses"
-    echo "    • Reconcile NIC and loopback IP addresses (stripping stale ones)"
-    echo "    • Create/verify dummy loopbacks per VRF"
-    echo "    • Start and verify FRR daemons"
+    echo "    - Remove legacy loopbacks (lo0..lo9)"
+    echo "    - Create/verify VRFs: ${ALL_VRFS_PREVIEW:-<computed>}"
+    echo "    - Move physical NICs into VRFs (with auto-derived IPv6)"
+    echo "    - Reconcile NIC IPs (strip stale)"
+    echo "    - Create/verify dummy loopbacks per VRF"
+    echo "    - Start and verify FRR daemons"
     echo
 
     if [[ "$MODE_YES" == "1" ]]; then
-        echo "  -y/--yes flag detected — proceeding without interactive confirmation."
+        echo "  -y/--yes flag detected -- proceeding."
         echo "==========================================================================="
         echo
         return 0
     fi
 
     if [[ ! -t 0 ]]; then
-        echo "  stdin is not a TTY — refusing to proceed without -y/--yes."
+        echo "  stdin is not a TTY -- refusing to proceed without -y/--yes."
         echo "==========================================================================="
         exit 1
     fi
@@ -304,41 +437,49 @@ confirm_or_exit() {
 }
 
 ############################
-# -l HANDLING (exits before any state changes)
+# -l HANDLING
 ############################
 
 if [[ "$MODE_LIST" == "1" ]]; then
     cat <<EOF
 
 ==========================================================================
-  $SCRIPT_NAME — Supported Environment Variables
+  $SCRIPT_NAME v$SCRIPT_VERSION -- Supported Environment Variables
 ==========================================================================
 
 EOF
-    print_env_vars show-effective
+    print_env_vars
 
     cat <<EOF
-Example overrides:
+IPv6 6to4 AUTO-DERIVATION:
+  Physical-NIC IPv6 addresses for VRF10/VRF20/VRF30 are auto-derived
+  from the NIC's IPv4 address using RFC 3056 6to4 mapping.
 
-  # Madrid
+  Formula:  A.B.C.D  ->  2002:AABB:CCDD::HOST/64
+            (where AA,BB,CC,DD are hex of each octet)
+
+  Examples:
+    192.168.113.100  ->  2002:c0a8:7164::HOST
+    192.168.110.200  ->  2002:c0a8:6ec8::HOST
+    172.20.113.200   ->  2002:ac14:71c8::HOST
+    172.30.113.200   ->  2002:ac1e:71c8::HOST
+
+  To override, set VRFxx_V6 explicitly.
+
+Examples:
+
   sudo MGMT_IFACE=ens224 VRF10_IFACE=ens192 VRF20_IFACE=ens256 \\
        SUBNET_OCTET=110 $SCRIPT_NAME
 
-  # Beijing (vrf10 + vrf30, no vrf20)
   sudo MGMT_IFACE=ens224 VRF10_IFACE=ens192 VRF30_IFACE=ens256 \\
-       VRF30_V4=172.30.113.200/24 VRF30_V6=2002:ac1e:71c8::200/64 \\
        SUBNET_OCTET=113 VRF_EXCLUDE="vrf20" $SCRIPT_NAME
-
-  # Paris
-  sudo MGMT_IFACE=ens160 VRF10_IFACE=ens224 VRF20_IFACE=ens256 \\
-       SUBNET_OCTET=114 $SCRIPT_NAME
 
 EOF
     exit 0
 fi
 
 ############################
-# VRF TOPOLOGY BUILD (data-driven)
+# VRF TOPOLOGY BUILD
 ############################
 
 VRF_SPECS=(
@@ -347,7 +488,6 @@ VRF_SPECS=(
 "vrf30 30 ${VRF30_IFACE} ${VRF30_V4} ${VRF30_V6} 10.30.${SUBNET_OCTET}. 2002:10:30:${SUBNET_OCTET}:: lo30"
 )
 
-# If iface is '-', clear the v4/v6 entries (keeps output clean)
 _cleaned_specs=()
 for spec in "${VRF_SPECS[@]}"; do
     # shellcheck disable=SC2206
@@ -363,15 +503,9 @@ VRF_SPECS=("${_cleaned_specs[@]}")
 DUMMY_INDICES=(1 2 3 4)
 LEGACY_LOOPBACKS=(lo0 lo1 lo2 lo3 lo4 lo5 lo6 lo7 lo8 lo9)
 
-# Build derived arrays
 ALL_VRFS=()
-declare -A VRF_TABLE
-declare -A VRF_IFACE
-declare -A VRF_IFACE_V4
-declare -A VRF_IFACE_V6
-declare -A VRF_LO_V4_BASE
-declare -A VRF_LO_V6_BASE
-declare -A VRF_LO_NAME_BASE
+declare -A VRF_TABLE VRF_IFACE VRF_IFACE_V4 VRF_IFACE_V6
+declare -A VRF_LO_V4_BASE VRF_LO_V6_BASE VRF_LO_NAME_BASE
 
 PROTECTED_IFACES=("${MGMT_IFACE}" lo)
 RP_FILTER_OFF_IFACES=()
@@ -382,18 +516,11 @@ PHYSICAL_IFACE_ADDRS=()
 for spec in "${VRF_SPECS[@]}"; do
     # shellcheck disable=SC2206
     fields=($spec)
-    vname="${fields[0]}"
-    vtable="${fields[1]}"
-    viface="${fields[2]}"
-    vv4="${fields[3]}"
-    vv6="${fields[4]}"
-    lov4="${fields[5]}"
-    lov6="${fields[6]}"
-    loname="${fields[7]}"
+    vname="${fields[0]}"; vtable="${fields[1]}"; viface="${fields[2]}"
+    vv4="${fields[3]}";   vv6="${fields[4]}"
+    lov4="${fields[5]}";  lov6="${fields[6]}"; loname="${fields[7]}"
 
-    if [[ " $VRF_EXCLUDE " == *" $vname "* ]]; then
-        continue
-    fi
+    [[ " $VRF_EXCLUDE " == *" $vname "* ]] && continue
 
     ALL_VRFS+=("$vname")
     VRF_TABLE[$vname]="$vtable"
@@ -408,9 +535,8 @@ for spec in "${VRF_SPECS[@]}"; do
         PHYSICAL_VRF_ASSIGNMENTS+=("$viface $vname")
         RP_FILTER_OFF_IFACES+=("$viface")
         IPV6_NO_RA_IFACES+=("$viface")
-        if [[ "$vv4" != "-" || "$vv6" != "-" ]]; then
+        [[ "$vv4" != "-" || "$vv6" != "-" ]] && \
             PHYSICAL_IFACE_ADDRS+=("$viface $vv4 $vv6")
-        fi
     fi
 done
 
@@ -550,7 +676,7 @@ preflight_check() {
     default_iface=$(ip -o route show default 2>/dev/null \
         | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
     if [[ -n "$default_iface" ]] && ! is_protected "$default_iface"; then
-        err "IPv4 default route via '$default_iface' — not in PROTECTED_IFACES."
+        err "IPv4 default route via '$default_iface' -- not in PROTECTED_IFACES."
         err "Add to PROTECTED_IFACES or fix MGMT_IFACE."
         fatal=1
     fi
@@ -560,14 +686,14 @@ preflight_check() {
         exit 1
     fi
 
-    log "Pre-flight config check: PASSED ✓"
+    log "Pre-flight config check: PASSED"
     log "  Management (protected) : ${PROTECTED_IFACES[*]}"
     log "  VRFs to manage         : ${ALL_VRFS[*]}"
     local v
     for v in "${ALL_VRFS[@]}"; do
         log "    $v (table ${VRF_TABLE[$v]}): iface=${VRF_IFACE[$v]}"
         log "       NIC v4=${VRF_IFACE_V4[$v]}  NIC v6=${VRF_IFACE_V6[$v]}"
-        log "       Loopbacks: ${VRF_LO_NAME_BASE[$v]}{1..4} → ${VRF_LO_V4_BASE[$v]}{1..4}/32, ${VRF_LO_V6_BASE[$v]}{1..4}/128"
+        log "       Loopbacks: ${VRF_LO_NAME_BASE[$v]}{1..4} -> ${VRF_LO_V4_BASE[$v]}{1..4}/32, ${VRF_LO_V6_BASE[$v]}{1..4}/128"
     done
     log "  Subnet octet           : ${SUBNET_OCTET}"
     log "  Host octet             : ${HOST_OCTET}"
@@ -585,7 +711,7 @@ ensure_ipv6_enabled() {
     local path=/proc/sys/net/ipv6/conf/$iface/disable_ipv6
     [[ -e "$path" ]] || return 0
     if [[ "$(cat "$path")" != "0" ]]; then
-        warn "  IPv6 was DISABLED on $iface — re-enabling"
+        warn "  IPv6 was DISABLED on $iface -- re-enabling"
         sysctl -w "net.ipv6.conf.$iface.disable_ipv6=0" >/dev/null 2>&1 || true
     fi
 }
@@ -619,7 +745,7 @@ persist_sysctls() {
     local file=/etc/sysctl.d/90-edge-router.conf
     log "Writing persistent sysctls to $file..."
     {
-        echo "# Managed by $SCRIPT_NAME — do not edit by hand"
+        echo "# Managed by $SCRIPT_NAME v$SCRIPT_VERSION -- do not edit by hand"
         echo
         echo "# --- Global forwarding + RP filter ---"
         echo "net.ipv4.ip_forward=1"
@@ -693,7 +819,7 @@ remove_docker_iface() {
 
     log "  -> deleting $iface"
     if ip link del "$iface" 2>/dev/null; then
-        log "  ✓ $iface removed"
+        log "  $iface removed"
     else
         warn "  could not delete $iface"
     fi
@@ -722,7 +848,7 @@ stop_and_disable_docker_services() {
     done
 
     if pgrep -x dockerd >/dev/null 2>&1 || pgrep -x containerd >/dev/null 2>&1; then
-        warn "Docker/containerd still running — forcing kill..."
+        warn "Docker/containerd still running -- forcing kill..."
         pkill -TERM dockerd containerd 2>/dev/null || true
         sleep 2
         pkill -KILL dockerd containerd 2>/dev/null || true
@@ -742,7 +868,7 @@ purge_docker_packages() {
     done
 
     if [[ ${#installed[@]} -eq 0 ]]; then
-        log "No Docker packages installed — nothing to purge."
+        log "No Docker packages installed -- nothing to purge."
         return 0
     fi
 
@@ -808,7 +934,7 @@ remove_docker_filesystem_artifacts() {
 
 docker_cleanup() {
     case "$DOCKER_CLEANUP_MODE" in
-        none)       log "DOCKER_CLEANUP_MODE=none — skipping."; return 0 ;;
+        none)       log "DOCKER_CLEANUP_MODE=none -- skipping."; return 0 ;;
         stop|purge) ;;
         *)          err "Invalid DOCKER_CLEANUP_MODE='$DOCKER_CLEANUP_MODE'."; return 1 ;;
     esac
@@ -852,14 +978,14 @@ docker_cleanup() {
 
     echo
     log "===== DOCKER REMOVAL SUMMARY ====="
-    [[ ${#dockers[@]} -eq 0 ]] && log "  Interfaces             : ✓ none remaining" \
+    [[ ${#dockers[@]} -eq 0 ]] && log "  Interfaces             : none remaining" \
                               || warn "  Interfaces remaining   : ${dockers[*]}"
     systemctl is-active  --quiet docker 2>/dev/null && warn "  docker.service         : still active" \
-                                                    || log  "  docker.service         : ✓ stopped"
+                                                    || log  "  docker.service         : stopped"
     systemctl is-enabled --quiet docker 2>/dev/null && warn "  docker.service         : still enabled" \
-                                                    || log  "  docker.service         : ✓ disabled"
+                                                    || log  "  docker.service         : disabled"
     if [[ "$DOCKER_CLEANUP_MODE" == "purge" ]]; then
-        [[ $still_installed -eq 0 ]] && log "  Packages               : ✓ all purged" \
+        [[ $still_installed -eq 0 ]] && log "  Packages               : all purged" \
                                      || warn "  Packages still present : $still_installed"
     fi
     echo
@@ -874,16 +1000,16 @@ remove_legacy_loopback() {
 
     [[ "$name" == "lo" ]] && { warn "Refusing to touch real 'lo'."; return 0; }
     is_protected "$name" && { warn "Refusing protected: $name"; return 0; }
-    link_exists "$name" || { log "Legacy $name: not present — nothing to do."; return 0; }
+    link_exists "$name" || { log "Legacy $name: not present -- nothing to do."; return 0; }
 
     local master
     master=$(current_master "$name")
     if [[ -n "$master" ]]; then
         if [[ "$LEGACY_LOOPBACK_REMOVE_FROM_VRF" != "yes" ]]; then
-            warn "Legacy $name is in VRF '$master' — skipping."
+            warn "Legacy $name is in VRF '$master' -- skipping."
             return 0
         fi
-        log "Legacy $name is in VRF '$master' — detaching (aggressive)."
+        log "Legacy $name is in VRF '$master' -- detaching (aggressive)."
         ip link set "$name" nomaster 2>/dev/null || warn "  nomaster failed"
     fi
 
@@ -893,7 +1019,7 @@ remove_legacy_loopback() {
         if ! is_dummy "$name"; then
             local kind
             kind=$(link_kind "$name")
-            warn "Legacy $name is type '${kind:-unknown}' (not dummy) — refusing."
+            warn "Legacy $name is type '${kind:-unknown}' (not dummy) -- refusing."
             return 0
         fi
     fi
@@ -926,7 +1052,7 @@ remove_legacy_loopback() {
     ip -6 route flush dev "$name" 2>/dev/null || true
 
     if ip link del "$name" 2>/dev/null; then
-        log "  ✓ $name removed"
+        log "  $name removed"
         return 0
     fi
 
@@ -935,7 +1061,7 @@ remove_legacy_loopback() {
         warn "  could not delete $name"
         return 1
     else
-        log "  ✓ $name removed (fallback)"
+        log "  $name removed (fallback)"
         return 0
     fi
 }
@@ -951,7 +1077,7 @@ ensure_vrf() {
         local have_table
         have_table=$(vrf_table_of "$name")
         if [[ "$have_table" == "$want_table" ]]; then
-            log "VRF $name already exists with table $want_table — keeping it."
+            log "VRF $name already exists with table $want_table -- keeping it."
         else
             err "VRF $name has wrong table '$have_table' (expected $want_table)."
             exit 1
@@ -967,7 +1093,7 @@ ensure_iface_in_vrf() {
     local iface=$1 vrf=$2
 
     is_protected "$iface" && { err "Refusing: $iface protected"; return 1; }
-    link_exists "$iface"  || { warn "$iface not present — skip."; return 0; }
+    link_exists "$iface"  || { warn "$iface not present -- skip."; return 0; }
     link_exists "$vrf"    || { err "$vrf missing"; return 1; }
 
     local table
@@ -976,7 +1102,7 @@ ensure_iface_in_vrf() {
     local cur moved=0
     cur=$(current_master "$iface")
     if [[ "$cur" == "$vrf" ]]; then
-        log "$iface already in $vrf — ok"
+        log "$iface already in $vrf -- ok"
     else
         [[ -n "$cur" ]] && warn "$iface in '$cur', moving to '$vrf'." \
                        || log  "$iface in GRT, moving to '$vrf'."
@@ -985,7 +1111,7 @@ ensure_iface_in_vrf() {
         ip link set "$iface" up
         moved=1
         [[ "$(current_master "$iface")" == "$vrf" ]] || { err "Failed to move $iface into $vrf."; return 1; }
-        log "$iface now enslaved to $vrf ✓"
+        log "$iface now enslaved to $vrf"
     fi
 
     ensure_ipv6_enabled "$iface"
@@ -1026,11 +1152,11 @@ ensure_iface_in_vrf() {
             | awk '/proto kernel/ && $1 !~ /^fe80/ && $1 !~ /^ff00/ {print $1}')
 
         ip route show table "$table" dev "$iface" | grep -q 'proto kernel scope link' \
-            && log "  ✓ IPv4 connected route for $iface in table $table" \
-            || warn "  ✗ IPv4 connected route missing"
+            && log "  IPv4 connected route for $iface in table $table" \
+            || warn "  IPv4 connected route missing"
         ip -6 route show table "$table" dev "$iface" | grep -qE 'proto kernel.*pref medium' \
-            && log "  ✓ IPv6 connected route for $iface in table $table" \
-            || warn "  ✗ IPv6 connected route missing"
+            && log "  IPv6 connected route for $iface in table $table" \
+            || warn "  IPv6 connected route missing"
     fi
 
     [[ -d /proc/sys/net/ipv4/conf/$iface ]] && \
@@ -1044,7 +1170,7 @@ reconcile_iface_addrs() {
     local iface=$1 desired_v4=$2 desired_v6=$3
 
     is_protected "$iface" && { err "Refusing: $iface protected"; return 1; }
-    link_exists "$iface"  || { warn "$iface not present — skip."; return 0; }
+    link_exists "$iface"  || { warn "$iface not present -- skip."; return 0; }
     ensure_ipv6_enabled "$iface"
 
     log "Reconciling addresses on $iface (desired v4=$desired_v4, v6=$desired_v6)..."
@@ -1138,7 +1264,7 @@ ensure_lo() {
         log "  attaching $name to $vrf"
         ip link set "$name" master "$vrf"
     else
-        log "  $name already in $vrf — ok"
+        log "  $name already in $vrf -- ok"
     fi
 }
 
@@ -1195,14 +1321,14 @@ start_and_verify_frr() {
         err "FRR is not installed."
         return 1
     fi
-    log "FRR is installed ✓"
+    log "FRR is installed"
 
     if frr_is_active; then
         if [[ "$FRR_FORCE_RESTART" == "1" ]]; then
-            log "FRR active — forced restart requested..."
+            log "FRR active -- forced restart requested..."
             systemctl restart frr
         else
-            log "FRR already active — leaving it running."
+            log "FRR already active -- leaving it running."
         fi
     else
         log "Starting FRR..."
@@ -1217,12 +1343,12 @@ start_and_verify_frr() {
         journalctl -u frr -n 40 --no-pager || true
         return 1
     fi
-    log "FRR systemd unit: ACTIVE ✓"
+    log "FRR systemd unit: ACTIVE"
 
     local expected
     mapfile -t expected < <(get_enabled_frr_daemons)
     [[ ${#expected[@]} -eq 0 ]] && {
-        warn "/etc/frr/daemons empty — falling back to watchfrr list."
+        warn "/etc/frr/daemons empty -- falling back to watchfrr list."
         mapfile -t expected < <(get_watchfrr_daemons)
     }
     local d
@@ -1259,12 +1385,12 @@ start_and_verify_frr() {
     done
     echo
 
-    [[ $missing_optional -gt 0 ]] && warn "$missing_optional daemon(s) missing binary — cosmetic."
+    [[ $missing_optional -gt 0 ]] && warn "$missing_optional daemon(s) missing binary -- cosmetic."
     for d in "${FRR_MANDATORY_DAEMONS[@]}"; do
         daemon_running "$d" || { err "MANDATORY daemon '$d' not running."; all_ok=0; }
     done
 
-    [[ $all_ok -eq 1 ]] && { log "All FRR daemons healthy ✓"; return 0; }
+    [[ $all_ok -eq 1 ]] && { log "All FRR daemons healthy"; return 0; }
     err "One or more FRR daemons are not healthy."
     return 1
 }
@@ -1273,10 +1399,8 @@ start_and_verify_frr() {
 # ============ MAIN ============
 ############################
 
-# 0. PRE-FLIGHT
 preflight_check
 
-# 1. KERNEL HARDENING
 log "Applying global sysctl tuning..."
 sysctl -w net.ipv4.ip_forward=1             >/dev/null
 sysctl -w net.ipv4.conf.all.rp_filter=0     >/dev/null
@@ -1366,7 +1490,6 @@ for v in "${ALL_VRFS[@]}"; do
     done
 done
 
-# VALIDATION
 echo
 log "VRF devices:"
 ip -br link show type vrf
@@ -1435,4 +1558,5 @@ if [[ $FRR_STATUS -ne 0 ]]; then
     exit 1
 fi
 
-log "Script finished successfully — all resources clean and healthy."
+log "Script finished successfully -- all resources clean and healthy."
+log "Baseline: $SCRIPT_NAME v$SCRIPT_VERSION ($SCRIPT_RELEASE_DATE)"
